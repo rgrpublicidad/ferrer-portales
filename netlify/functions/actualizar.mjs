@@ -4,7 +4,8 @@
  *
  * Se ejecuta cada día a las 7:00 UTC (8:00 hora Canarias invierno / 8:00 verano)
  * Lee los partes de conserje@ferreryperdomo.com, extrae los portales limpiados
- * del PDF adjunto, y actualiza el index.html en GitHub → Netlify lo publica.
+ * del PDF adjunto, y AÑADE solo las filas nuevas al index.html en GitHub.
+ * NUNCA borra ni modifica filas existentes.
  */
 
 import { google } from 'googleapis';
@@ -32,8 +33,8 @@ function diaSemana(date) {
 /** Normaliza el nombre del turno al código corto */
 function normalizaTurno(turno) {
   const t = turno.toLowerCase();
-  if (t.includes('lunes') && t.includes('mañana')) return 'L-V mañana';
-  if (t.includes('lunes') && t.includes('tarde'))  return 'L-V tarde';
+  if ((t.includes('lunes') || t.includes('viernes')) && t.includes('mañana')) return 'L-V mañana';
+  if ((t.includes('lunes') || t.includes('viernes')) && t.includes('tarde'))  return 'L-V tarde';
   if (t.includes('laborables') && t.includes('mañana')) return 'No lab. mañana';
   if (t.includes('laborables') && t.includes('tarde'))  return 'No lab. tarde';
   return turno;
@@ -41,17 +42,16 @@ function normalizaTurno(turno) {
 
 /**
  * Extrae qué portales (26-33) aparecen mencionados como limpios en el texto del PDF.
- * Busca patrones como "portal 26", "portales 26,27,28,29", etc.
- * Devuelve un Set con los números de portal encontrados.
+ * Usa múltiples patrones para cubrir las distintas formas de escritura de los conserjes.
  */
 function extraePortales(texto) {
   const portalesLimpios = new Set();
   const textoNorm = texto.toLowerCase();
 
-  // Busca "portal(es) XX" o "portal(es) XX, YY, ZZ"
-  const patron = /portales?\s+([\d\s,yY]+)/g;
+  // Patrón 1: "portal(es) n? XX" — cubre "portal 26", "portal n 26", "portales 26, 27"
+  const patron1 = /portales?\s+(?:n[°º.]?\s*)?(\d[\d\s,yY]*)/g;
   let m;
-  while ((m = patron.exec(textoNorm)) !== null) {
+  while ((m = patron1.exec(textoNorm)) !== null) {
     const numeros = m[1].match(/\d+/g) || [];
     for (const n of numeros) {
       const num = parseInt(n);
@@ -59,10 +59,23 @@ function extraePortales(texto) {
     }
   }
 
-  // También busca números individuales seguidos de contexto de limpieza
-  // p.ej. "limpio el portal 33"
-  const patron2 = /(?:limpi(?:o|é|a)|barri(?:ó|o)|freg(?:ó|o))\s+(?:el\s+)?portal\s+(\d+)/g;
+  // Patrón 2: "limpio/barrió/fregó el portal n? XX"
+  const patron2 = /(?:limpi(?:o|é|a|ó)|barri(?:ó|o)|freg(?:ó|o)|lav(?:ó|o))\s+(?:el\s+)?portal\s+(?:n[°º.]?\s*)?(\d+)/g;
   while ((m = patron2.exec(textoNorm)) !== null) {
+    const num = parseInt(m[1]);
+    if (num >= 26 && num <= 33) portalesLimpios.add(num);
+  }
+
+  // Patrón 3: "se limpió el portal n XX" (forma pasiva)
+  const patron3 = /se\s+limpi(?:o|ó)\s+(?:el\s+)?portal\s+(?:n[°º.]?\s*)?(\d+)/g;
+  while ((m = patron3.exec(textoNorm)) !== null) {
+    const num = parseInt(m[1]);
+    if (num >= 26 && num <= 33) portalesLimpios.add(num);
+  }
+
+  // Patrón 4: cualquier número 26-33 precedido de "portal" con hasta 5 chars entre medio
+  const patron4 = /portal[^\d]{0,5}(\d+)/g;
+  while ((m = patron4.exec(textoNorm)) !== null) {
     const num = parseInt(m[1]);
     if (num >= 26 && num <= 33) portalesLimpios.add(num);
   }
@@ -77,7 +90,6 @@ async function descargaYLeePdf(gmail, messageId, attachmentId) {
     messageId,
     id: attachmentId,
   });
-  // Los datos vienen en base64 con URL-safe encoding (- en vez de +, _ en vez de /)
   const base64 = resp.data.data.replace(/-/g, '+').replace(/_/g, '/');
   const buffer = Buffer.from(base64, 'base64');
   try {
@@ -115,78 +127,91 @@ function generaFila(fecha, turno, conserje, portalesLimpios) {
     </tr>`;
 }
 
-/** Genera el HTML completo a partir de todas las filas */
-function generaHtml(filas, totales, fechaActualizacion) {
-  const filasHtml = filas.join('\n');
+/**
+ * Extrae las claves "DD/MM-turnoCorto" de las filas ya existentes en el HTML.
+ * Así sabemos qué partes ya están registrados y no los volvemos a añadir.
+ */
+function extraeFilasExistentes(html) {
+  const existentes = new Set();
+  // Busca patrones como: "Lun 18/05" y "L-V mañana" dentro de cada <tr>
+  const patronFila = /semana-label[^>]*>([^<]+)<\/span><br><small>([^<]+)<\/small>/g;
+  let m;
+  while ((m = patronFila.exec(html)) !== null) {
+    // m[1] = "Lun 18/05", m[2] = "L-V mañana"
+    // Extraemos solo DD/MM del label
+    const fechaMatch = m[1].match(/(\d{2}\/\d{2})/);
+    if (fechaMatch) {
+      existentes.add(`${fechaMatch[1]}-${m[2].trim()}`);
+    }
+  }
+  return existentes;
+}
 
+/**
+ * Recalcula los totales leyendo el HTML completo (filas existentes + nuevas).
+ */
+function recalculaTotales(html) {
+  const totales = {};
+  for (let p = 26; p <= 33; p++) totales[p] = 0;
+
+  // Cuenta las celdas "limpio" por columna en cada fila de datos (no la fila de totales)
+  // Estrategia: partir por <tr>, ignorar la fila de totales y el thead
+  const filas = html.split('<tr>');
+  for (const fila of filas) {
+    if (fila.includes('class="totales"') || fila.includes('<th')) continue;
+    const portales = [26, 27, 28, 29, 30, 31, 32, 33];
+    const celdas = fila.split('<td');
+    // La primera celda es la fecha, las siguientes son los portales en orden
+    for (let i = 0; i < portales.length; i++) {
+      const celda = celdas[i + 1] || '';
+      if (celda.includes('class="limpio"')) {
+        totales[portales[i]]++;
+      }
+    }
+  }
+  return totales;
+}
+
+/**
+ * Inserta nuevas filas ANTES de la fila de totales en el HTML existente,
+ * y actualiza la fila de totales con los nuevos recuentos.
+ */
+function insertaFilasEnHtml(htmlActual, filasNuevas, fechaActualizacion) {
+  if (filasNuevas.length === 0) return htmlActual;
+
+  const filasHtml = filasNuevas.join('\n');
+
+  // Insertar antes de la fila de totales
+  const marcador = '<tr class="totales">';
+  if (!htmlActual.includes(marcador)) {
+    console.log('No se encontró la fila de totales en el HTML existente.');
+    return htmlActual;
+  }
+
+  let nuevoHtml = htmlActual.replace(marcador, filasHtml + '\n\n    ' + marcador);
+
+  // Recalcular totales
+  const totales = recalculaTotales(nuevoHtml);
   const totalesHtml = [26, 27, 28, 29, 30, 31, 32, 33]
     .map(p => `<td>${totales[p] || 0}</td>`)
     .join('\n      ');
 
-  // Rango de fechas para el subtítulo de totales
-  const primeraFecha = filas.length > 0 ? 'inicio' : '-';
-
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Limpieza de portales - Ferrer y Perdomo</title>
-<style>
-  body { font-family: Arial, sans-serif; font-size: 13px; margin: 40px; color: #222; }
-  h1 { font-size: 20px; color: #1a3a5c; border-bottom: 2px solid #1a3a5c; padding-bottom: 6px; margin-bottom: 4px; }
-  p.subtitulo { font-size: 12px; color: #666; margin-top: 2px; margin-bottom: 20px; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
-  th { background: #1a3a5c; color: #fff; padding: 7px 10px; text-align: center; font-size: 12px; }
-  th.col-fecha { text-align: left; width: 130px; }
-  td { border: 1px solid #c8d4e0; padding: 7px 6px; vertical-align: middle; font-size: 12px; text-align: center; }
-  td.col-fecha { text-align: left; }
-  .ok { color: #2a7a2a; font-weight: bold; font-size: 14px; }
-  .nota { font-size: 11px; color: #555; margin-top: 16px; border-left: 3px solid #1a3a5c; padding-left: 8px; }
-  .semana-label { font-weight: bold; color: #1a3a5c; }
-  small { color: #555; display: block; font-size: 10px; }
-  .limpio { background: #eaf5ea; }
-  .vacio { background: #f9f9f9; }
-  .totales { background: #1a3a5c; color: #fff; font-weight: bold; }
-  .totales td { color: #fff; border-color: #2a5a8c; }
-</style>
-</head>
-<body>
-
-<h1>Recuento de limpieza por portal - Edificio Ferrer y Perdomo</h1>
-<p class="subtitulo">Fuente: PDFs adjuntos a los partes de conserje@ferreryperdomo.com &nbsp;|&nbsp; Actualizado: ${fechaActualizacion}</p>
-
-<table>
-  <thead>
-    <tr>
-      <th class="col-fecha">Fecha / turno</th>
-      <th>Portal 26</th>
-      <th>Portal 27</th>
-      <th>Portal 28</th>
-      <th>Portal 29</th>
-      <th>Portal 30</th>
-      <th>Portal 31</th>
-      <th>Portal 32</th>
-      <th>Portal 33</th>
-    </tr>
-  </thead>
-  <tbody>
-${filasHtml}
-
-    <tr class="totales">
+  // Reemplazar la fila de totales completa
+  nuevoHtml = nuevoHtml.replace(
+    /<tr class="totales">[\s\S]*?<\/tr>/,
+    `<tr class="totales">
       <td class="col-fecha" style="color:#fff">Total limpiezas<br><small style="color:#aac">acumulado</small></td>
       ${totalesHtml}
-    </tr>
+    </tr>`
+  );
 
-  </tbody>
-</table>
+  // Actualizar fecha de actualización
+  nuevoHtml = nuevoHtml.replace(
+    /Actualizado: [\d\/]+(?: \(auto\))?/,
+    `Actualizado: ${fechaActualizacion} (auto)`
+  );
 
-<p class="nota">
-  <strong>Nota:</strong> cada fila corresponde a un turno. Las celdas verdes indican que el conserje registró la limpieza de ese portal en el PDF de su parte. Las celdas vacías no significan necesariamente que no se limpió, sino que no se recoge explícitamente en el parte de ese turno.
-</p>
-
-</body>
-</html>`;
+  return nuevoHtml;
 }
 
 // ─── Handler principal ───────────────────────────────────────────────────────
@@ -202,7 +227,7 @@ export const handler = async () => {
   auth.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
   const gmail = google.gmail({ version: 'v1', auth });
 
-  // 2. Obtener el index.html actual de GitHub (necesitamos el SHA para actualizarlo)
+  // 2. Obtener el index.html actual de GitHub
   const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
   const [owner, repo] = process.env.GITHUB_REPO.split('/');
 
@@ -212,25 +237,29 @@ export const handler = async () => {
     const { data } = await octokit.repos.getContent({ owner, repo, path: 'index.html' });
     shaActual = data.sha;
     htmlActual = Buffer.from(data.content, 'base64').toString('utf-8');
+    console.log('HTML actual obtenido de GitHub.');
   } catch (e) {
-    console.log('index.html no encontrado en GitHub, se creará desde cero.');
+    console.log('index.html no encontrado en GitHub.');
+    return { statusCode: 500, body: 'No se encontró index.html en GitHub.' };
   }
 
-  // 3. Buscar todos los partes (últimos 90 días para tener histórico completo)
-  //    En producción podrías limitar a newer_than:2d y mergear con el HTML existente.
-  //    Para simplicidad, regeneramos desde los últimos 90 días cada vez.
-  const query = 'from:conserje@ferreryperdomo.com subject:Parte newer_than:90d';
+  // 3. Extraer qué filas ya existen para no duplicarlas
+  const filasExistentes = extraeFilasExistentes(htmlActual);
+  console.log(`Filas ya existentes en el HTML: ${filasExistentes.size}`);
+
+  // 4. Buscar partes de los últimos 3 días en Gmail
+  const query = 'from:conserje@ferreryperdomo.com subject:Parte newer_than:3d';
   const listResp = await gmail.users.threads.list({
     userId: 'me',
     q: query,
-    maxResults: 200,
+    maxResults: 50,
   });
 
   const threads = listResp.data.threads || [];
-  console.log(`Encontrados ${threads.length} hilos de partes.`);
+  console.log(`Encontrados ${threads.length} hilos de partes recientes.`);
 
-  // 4. Procesar cada hilo
-  const partes = [];
+  // 5. Procesar cada hilo y filtrar los que ya están en el HTML
+  const partesNuevos = [];
   for (const thread of threads) {
     const threadData = await gmail.users.threads.get({
       userId: 'me',
@@ -238,21 +267,17 @@ export const handler = async () => {
       format: 'full',
     });
 
-    // Tomamos solo el primer mensaje del hilo (evita duplicados de reenvíos)
     const msg = threadData.data.messages[0];
     const headers = msg.payload.headers;
     const subject = headers.find(h => h.name === 'Subject')?.value || '';
     const dateStr = headers.find(h => h.name === 'Date')?.value || '';
     const fecha = new Date(dateStr);
 
-    // Extraer conserje y turno del asunto
-    // Formato: "Parte de 2026-05-18 de Juan Antonio No laborables tarde"
+    console.log(`  Asunto: "${subject}"`);
     const matchAsunto = subject.match(/Parte de [\d-]+ de (.+)/);
-    if (!matchAsunto) continue;
+    if (!matchAsunto) { console.log('  → No coincide con el patrón, se descarta.'); continue; }
 
     const resto = matchAsunto[1].trim();
-
-    // Los conserjes conocidos (en orden de longitud desc para evitar match parcial)
     const conserjesConocidos = ['Juan Antonio', 'Juan Manuel', 'Carmelo', 'Ruymán'];
     let conserje = null;
     let turno = resto;
@@ -263,11 +288,20 @@ export const handler = async () => {
         break;
       }
     }
-    if (!conserje) continue;
+    if (!conserje) { console.log('  → Conserje no reconocido, se descarta.'); continue; }
+
+    const turnoCorto = normalizaTurno(turno);
+    const dd = fechaCorta(fecha);
+    const clave = `${dd}-${turnoCorto}`;
+
+    if (filasExistentes.has(clave)) {
+      console.log(`  → ${clave} ya existe en el HTML, se omite.`);
+      continue;
+    }
+
+    console.log(`  → NUEVO: ${clave} de ${conserje}`);
 
     // Buscar el PDF adjunto
-    let textoPdf = '';
-    const partes2 = msg.payload.parts || [];
     const buscarPdf = (parts) => {
       for (const part of parts) {
         if (part.mimeType === 'application/pdf' && part.body?.attachmentId) {
@@ -281,55 +315,49 @@ export const handler = async () => {
       return null;
     };
 
+    const partes2 = msg.payload.parts || [];
     const attachmentId = buscarPdf(partes2);
+    let textoPdf = '';
     if (attachmentId) {
       textoPdf = await descargaYLeePdf(gmail, msg.id, attachmentId);
     }
 
     const portalesLimpios = extraePortales(textoPdf);
+    console.log(`  → Portales detectados: ${[...portalesLimpios].join(', ') || 'ninguno'}`);
 
-    partes.push({ fecha, conserje, turno, portalesLimpios });
+    partesNuevos.push({ fecha, conserje, turno, portalesLimpios });
   }
 
-  // 5. Ordenar por fecha ascendente
-  partes.sort((a, b) => a.fecha - b.fecha);
-
-  // 6. Generar filas y calcular totales
-  const filas = [];
-  const totales = {};
-  for (let p = 26; p <= 33; p++) totales[p] = 0;
-
-  for (const parte of partes) {
-    filas.push(generaFila(parte.fecha, parte.turno, parte.conserje, parte.portalesLimpios));
-    for (const p of parte.portalesLimpios) {
-      if (p >= 26 && p <= 33) totales[p]++;
-    }
+  if (partesNuevos.length === 0) {
+    console.log('No hay partes nuevos que añadir.');
+    return { statusCode: 200, body: 'Sin cambios.' };
   }
 
-  // 7. Generar HTML completo
+  // 6. Ordenar los nuevos por fecha ascendente y generar sus filas
+  partesNuevos.sort((a, b) => a.fecha - b.fecha);
+  const filasNuevas = partesNuevos.map(p =>
+    generaFila(p.fecha, p.turno, p.conserje, p.portalesLimpios)
+  );
+
+  // 7. Insertar filas nuevas en el HTML existente (nunca borra lo anterior)
   const fechaActualizacion = new Date().toLocaleDateString('es-ES', {
     timeZone: 'Atlantic/Canary',
     day: '2-digit',
     month: '2-digit',
     year: 'numeric',
   });
-  const nuevoHtml = generaHtml(filas, totales, fechaActualizacion);
+  const nuevoHtml = insertaFilasEnHtml(htmlActual, filasNuevas, fechaActualizacion);
 
-  // 8. Subir a GitHub solo si hay cambios
-  if (nuevoHtml === htmlActual) {
-    console.log('Sin cambios, no se actualiza GitHub.');
-    return { statusCode: 200, body: 'Sin cambios.' };
-  }
-
+  // 8. Subir a GitHub
   await octokit.repos.createOrUpdateFileContents({
     owner,
     repo,
     path: 'index.html',
-    message: `Actualización automática ${fechaActualizacion}`,
+    message: `Actualización automática ${fechaActualizacion} (+${partesNuevos.length} partes)`,
     content: Buffer.from(nuevoHtml).toString('base64'),
     sha: shaActual,
   });
 
-  console.log('index.html actualizado en GitHub correctamente.');
-  return { statusCode: 200, body: 'Actualizado correctamente.' };
+  console.log(`index.html actualizado en GitHub con ${partesNuevos.length} partes nuevos.`);
+  return { statusCode: 200, body: `Añadidos ${partesNuevos.length} partes nuevos.` };
 };
