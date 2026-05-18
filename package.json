@@ -1,0 +1,11 @@
+{
+  "name": "ferrer-portales",
+  "version": "1.0.0",
+  "description": "Seguimiento de limpieza de portales - Edificio Ferrer y Perdomo",
+  "type": "module",
+  "dependencies": {
+    "googleapis": "^144.0.0",
+    "@octokit/rest": "^21.0.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
