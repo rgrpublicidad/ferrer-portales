@@ -149,22 +149,36 @@ function extraeFilasExistentes(html) {
 
 /**
  * Recalcula los totales leyendo el HTML completo (filas existentes + nuevas).
+ * Parsea cada <tr> que no sea de totales ni de cabecera, y cuenta las celdas limpio
+ * por posición (columna 1 = portal 26, columna 2 = portal 27, etc.)
  */
 function recalculaTotales(html) {
   const totales = {};
   for (let p = 26; p <= 33; p++) totales[p] = 0;
 
-  // Cuenta las celdas "limpio" por columna en cada fila de datos (no la fila de totales)
-  // Estrategia: partir por <tr>, ignorar la fila de totales y el thead
-  const filas = html.split('<tr>');
-  for (const fila of filas) {
-    if (fila.includes('class="totales"') || fila.includes('<th')) continue;
+  // Extraer todas las filas de datos (excluir thead y fila de totales)
+  const patronFila = /<tr(?!\s*class="totales")>([\s\S]*?)<\/tr>/g;
+  let fila;
+  while ((fila = patronFila.exec(html)) !== null) {
+    const contenido = fila[1];
+    // Ignorar filas de cabecera (contienen <th)
+    if (contenido.includes('<th')) continue;
+    // Ignorar fila de totales
+    if (contenido.includes('Total limpiezas')) continue;
+
+    // Extraer todas las <td> de esta fila
+    const celdas = [];
+    const patronCelda = /<td([^>]*)>([\s\S]*?)<\/td>/g;
+    let celda;
+    while ((celda = patronCelda.exec(contenido)) !== null) {
+      celdas.push(celda[1]); // guardamos los atributos de la td
+    }
+
+    // La primera td es la fecha, las siguientes son portales 26-33
     const portales = [26, 27, 28, 29, 30, 31, 32, 33];
-    const celdas = fila.split('<td');
-    // La primera celda es la fecha, las siguientes son los portales en orden
     for (let i = 0; i < portales.length; i++) {
-      const celda = celdas[i + 1] || '';
-      if (celda.includes('class="limpio"')) {
+      const atributos = celdas[i + 1] || '';
+      if (atributos.includes('limpio')) {
         totales[portales[i]]++;
       }
     }
